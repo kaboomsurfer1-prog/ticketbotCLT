@@ -12,6 +12,14 @@ TICKET_PANEL_CHANNEL_ID = int(os.getenv("TICKET_PANEL_CHANNEL_ID", "151653436822
 TICKET_SUPPORT_ROLE_ID = int(os.getenv("TICKET_SUPPORT_ROLE_ID", "1505906083812737134"))
 TICKET_CLOSE_ROLE_ID = int(os.getenv("TICKET_CLOSE_ROLE_ID", "1516627835538903140"))
 
+# Roluri care NU trebuie sa vada canalele ticket.
+# ATENTIE: daca rolul are Administrator, Discord ignora permisiunile canalului.
+TICKET_DENY_ROLE_IDS = [
+    int(role_id.strip())
+    for role_id in os.getenv("TICKET_DENY_ROLE_IDS", "1516635039520260186").split(",")
+    if role_id.strip().isdigit()
+]
+
 # 0 = foloseste aceeasi categorie unde se afla canalul panelului
 TICKET_CATEGORY_ID = int(os.getenv("TICKET_CATEGORY_ID", "0"))
 
@@ -122,6 +130,66 @@ async def cleanup_missing_ticket(user_id: int):
         save_active_tickets(active_tickets)
 
 
+def build_ticket_overwrites(
+    guild: discord.Guild,
+    ticket_owner: discord.Member,
+    support_role: discord.Role,
+    close_role: discord.Role
+) -> dict:
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=False
+        ),
+        ticket_owner: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True
+        ),
+        support_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True
+        ),
+        close_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            manage_messages=True,
+            attach_files=True,
+            embed_links=True
+        )
+    }
+
+    # Blocheaza explicit rolurile care nu trebuie sa vada ticketurile.
+    # Daca acelasi rol este si support_role / close_role, nu il blocam.
+    allowed_role_ids = {TICKET_SUPPORT_ROLE_ID, TICKET_CLOSE_ROLE_ID}
+    for role_id in TICKET_DENY_ROLE_IDS:
+        if role_id in allowed_role_ids:
+            continue
+
+        role = guild.get_role(role_id)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=False,
+                send_messages=False,
+                read_message_history=False
+            )
+
+    return overwrites
+
+
 class TicketIdModal(discord.ui.Modal, title="Creează Ticket"):
     game_id = discord.ui.TextInput(
         label="ID-ul tău din joc",
@@ -171,47 +239,16 @@ class TicketIdModal(discord.ui.Modal, title="Creează Ticket"):
         category = await get_ticket_category(interaction.guild)
         channel_name = f"{TICKET_CHANNEL_PREFIX}-{safe_channel_name(interaction.user.name)}"
 
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(
-                view_channel=False
-            ),
-            interaction.user: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                embed_links=True
-            ),
-            support_role: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                embed_links=True
-            ),
-            close_role: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                embed_links=True
-            ),
-            interaction.guild.me: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                manage_channels=True,
-                manage_messages=True,
-                attach_files=True,
-                embed_links=True
-            )
-        }
-
         try:
             ticket_channel = await interaction.guild.create_text_channel(
                 name=channel_name,
                 category=category,
-                overwrites=overwrites,
+                overwrites=build_ticket_overwrites(
+                    interaction.guild,
+                    interaction.user,
+                    support_role,
+                    close_role
+                ),
                 topic=f"Ticket creat de {interaction.user} | UserID: {interaction.user.id} | GameID: {self.game_id.value}",
                 reason=f"Ticket creat de {interaction.user}"
             )
@@ -386,6 +423,54 @@ async def ticket_status(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         f"✅ Ticketuri deschise: `{len(active_tickets)}`",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="ticket_fix_permissions", description="Repară permisiunile ticketurilor deschise.")
+async def ticket_fix_permissions(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member) or not has_role(interaction.user, TICKET_CLOSE_ROLE_ID):
+        await interaction.response.send_message(
+            "❌ Nu ai permisiunea să folosești această comandă.",
+            ephemeral=True
+        )
+        return
+
+    support_role = interaction.guild.get_role(TICKET_SUPPORT_ROLE_ID)
+    close_role = interaction.guild.get_role(TICKET_CLOSE_ROLE_ID)
+
+    if support_role is None or close_role is None:
+        await interaction.response.send_message(
+            "❌ Rolurile configurate nu au fost găsite.",
+            ephemeral=True
+        )
+        return
+
+    fixed = 0
+
+    for user_id, channel_id in list(active_tickets.items()):
+        channel = interaction.guild.get_channel(int(channel_id))
+        member = interaction.guild.get_member(int(user_id))
+
+        if not isinstance(channel, discord.TextChannel) or member is None:
+            continue
+
+        try:
+            await channel.edit(
+                overwrites=build_ticket_overwrites(
+                    interaction.guild,
+                    member,
+                    support_role,
+                    close_role
+                ),
+                reason="Fix permisiuni ticket"
+            )
+            fixed += 1
+        except Exception:
+            pass
+
+    await interaction.response.send_message(
+        f"✅ Permisiunile au fost reparate pentru `{fixed}` ticketuri.",
         ephemeral=True
     )
 
