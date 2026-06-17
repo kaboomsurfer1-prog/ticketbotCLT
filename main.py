@@ -226,7 +226,6 @@ def build_ticket_overwrites(
     }
 
     # Blocheaza explicit rolurile care nu trebuie sa vada ticketurile.
-    # Daca acelasi rol este si support_role / close_role, nu il blocam.
     allowed_role_ids = {TICKET_SUPPORT_ROLE_ID, TICKET_CLOSE_ROLE_ID}
     for role_id in TICKET_DENY_ROLE_IDS:
         if role_id in allowed_role_ids:
@@ -346,6 +345,82 @@ class TicketIdModal(discord.ui.Modal, title="Creează Ticket"):
                 f"❌ A apărut o eroare la crearea ticketului: `{e}`",
                 ephemeral=True
             )
+
+
+class CloseReasonModal(discord.ui.Modal, title="Închide Ticket"):
+    close_reason = discord.ui.TextInput(
+        label="Motivul închiderii ticketului",
+        placeholder="Scrie motivul pentru care ticketul este închis...",
+        required=True,
+        style=discord.TextStyle.paragraph,
+        max_length=1000
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "❌ Această acțiune poate fi folosită doar pe server.",
+                ephemeral=True
+            )
+            return
+
+        if not has_role(interaction.user, TICKET_CLOSE_ROLE_ID):
+            await interaction.response.send_message(
+                "❌ Nu ai permisiunea să închizi acest ticket.",
+                ephemeral=True
+            )
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "❌ Această comandă poate fi folosită doar într-un canal ticket.",
+                ephemeral=True
+            )
+            return
+
+        owner_id, record = get_ticket_record_by_channel(channel.id)
+
+        if owner_id:
+            active_tickets.pop(owner_id, None)
+            save_active_tickets(active_tickets)
+
+        reason = str(self.close_reason.value).strip()
+
+        await interaction.response.send_message(
+            f"🔒 Ticketul a fost închis de {interaction.user.mention}.\n"
+            f"**Motiv:** {reason}\n"
+            f"Canalul se va șterge în `{TICKET_DELETE_DELAY}` secunde."
+        )
+
+        taken_by_text = "`nepreluat`"
+        if record and record.get("taken_by"):
+            taken_by_text = f"<@{record.get('taken_by')}>"
+
+        game_id_text = "`necunoscut`"
+        if record and record.get("game_id"):
+            game_id_text = f"`{record.get('game_id')}`"
+
+        log_embed = discord.Embed(
+            title="🔒 Ticket închis",
+            description=(
+                f"Ticket închis de user: {interaction.user.mention}\n"
+                f"Ticket creat de: {f'<@{owner_id}>' if owner_id else '`necunoscut`'}\n"
+                f"Preluat de: {taken_by_text}\n"
+                f"ID jucător: {game_id_text}\n"
+                f"Canal: `#{channel.name}`\n\n"
+                f"**Motiv închidere:**\n{reason}"
+            ),
+            color=discord.Color.red()
+        )
+        await send_log(interaction.guild, log_embed)
+
+        await asyncio.sleep(TICKET_DELETE_DELAY)
+
+        try:
+            await channel.delete(reason=f"Ticket închis de {interaction.user}: {reason}")
+        except Exception:
+            pass
 
 
 class TicketPanelView(discord.ui.View):
@@ -475,42 +550,7 @@ class TicketControlView(discord.ui.View):
             )
             return
 
-        channel = interaction.channel
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message(
-                "❌ Această comandă poate fi folosită doar într-un canal ticket.",
-                ephemeral=True
-            )
-            return
-
-        owner_id, record = get_ticket_record_by_channel(channel.id)
-
-        if owner_id:
-            active_tickets.pop(owner_id, None)
-            save_active_tickets(active_tickets)
-
-        await interaction.response.send_message(
-            f"🔒 Ticketul a fost închis de {interaction.user.mention}. "
-            f"Canalul se va șterge în `{TICKET_DELETE_DELAY}` secunde."
-        )
-
-        log_embed = discord.Embed(
-            title="🔒 Ticket închis",
-            description=(
-                f"Ticket închis de user: {interaction.user.mention}\n"
-                f"Canal: `#{channel.name}`\n"
-                f"Ticket creat de: {f'<@{owner_id}>' if owner_id else '`necunoscut`'}"
-            ),
-            color=discord.Color.red()
-        )
-        await send_log(interaction.guild, log_embed)
-
-        await asyncio.sleep(TICKET_DELETE_DELAY)
-
-        try:
-            await channel.delete(reason=f"Ticket închis de {interaction.user}")
-        except Exception:
-            pass
+        await interaction.response.send_modal(CloseReasonModal())
 
 
 async def send_or_find_panel():
