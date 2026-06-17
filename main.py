@@ -9,6 +9,8 @@ from discord.ext import commands
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 TICKET_PANEL_CHANNEL_ID = int(os.getenv("TICKET_PANEL_CHANNEL_ID", "1516534368225591386"))
+TICKET_LOG_CHANNEL_ID = int(os.getenv("TICKET_LOG_CHANNEL_ID", "1516617002205319239"))
+
 TICKET_SUPPORT_ROLE_ID = int(os.getenv("TICKET_SUPPORT_ROLE_ID", "1505906083812737134"))
 TICKET_CLOSE_ROLE_ID = int(os.getenv("TICKET_CLOSE_ROLE_ID", "1516627835538903140"))
 
@@ -59,6 +61,10 @@ def has_role(member: discord.Member, role_id: int) -> bool:
     return any(role.id == role_id for role in member.roles)
 
 
+def can_staff_take_ticket(member: discord.Member) -> bool:
+    return has_role(member, TICKET_SUPPORT_ROLE_ID) or has_role(member, TICKET_CLOSE_ROLE_ID)
+
+
 def safe_channel_name(name: str) -> str:
     clean = name.lower()
     allowed = "abcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -66,6 +72,35 @@ def safe_channel_name(name: str) -> str:
     while "--" in clean:
         clean = clean.replace("--", "-")
     return clean.strip("-")[:30] or "user"
+
+
+def get_ticket_record_by_channel(channel_id: int) -> tuple[str | None, dict | None]:
+    for user_id, value in active_tickets.items():
+        if isinstance(value, dict):
+            if str(value.get("channel_id")) == str(channel_id):
+                return user_id, value
+        else:
+            # Compatibilitate cu versiunea veche: user_id -> channel_id
+            if str(value) == str(channel_id):
+                record = {"channel_id": str(value), "game_id": "", "taken_by": None}
+                active_tickets[user_id] = record
+                save_active_tickets(active_tickets)
+                return user_id, record
+
+    return None, None
+
+
+async def send_log(guild: discord.Guild, embed: discord.Embed):
+    log_channel = guild.get_channel(TICKET_LOG_CHANNEL_ID)
+
+    if not isinstance(log_channel, discord.TextChannel):
+        print(f"Eroare: canalul de log nu a fost gasit: {TICKET_LOG_CHANNEL_ID}")
+        return
+
+    try:
+        await log_channel.send(embed=embed)
+    except Exception as e:
+        print(f"Eroare la trimiterea logului: {e}")
 
 
 def build_panel_embed() -> discord.Embed:
@@ -96,13 +131,14 @@ def build_ticket_embed(member: discord.Member, game_id: str) -> discord.Embed:
             "Te rugăm să descrii problema cât mai clar posibil.\n\n"
             "⚠️ **Dacă ticketul este o reclamație, este obligatoriu să trimiți dovezi audio-video / foto.**\n"
             "Orice reclamație fără dovezi clare nu va fi luată în considerare și poate fi închisă.\n\n"
-            "Un membru staff îți va răspunde în cel mai scurt timp posibil."
+            "Un membru staff îți va răspunde în cel mai scurt timp posibil.\n\n"
+            "🔒 Staff-ul poate vedea ticketul, dar poate scrie doar după ce apasă pe butonul **Preia Ticket**."
         ),
         color=discord.Color.green()
     )
     embed.add_field(name="ID jucător", value=f"`{game_id}`", inline=True)
     embed.add_field(name="Creat de", value=member.mention, inline=True)
-    embed.set_footer(text="Doar staff-ul autorizat poate închide ticketul.")
+    embed.set_footer(text="Doar staff-ul autorizat poate prelua / închide ticketul.")
     return embed
 
 
@@ -120,8 +156,18 @@ async def get_ticket_category(guild: discord.Guild) -> discord.CategoryChannel |
 
 
 async def cleanup_missing_ticket(user_id: int):
-    channel_id = active_tickets.get(str(user_id))
+    value = active_tickets.get(str(user_id))
+    if not value:
+        return
+
+    if isinstance(value, dict):
+        channel_id = value.get("channel_id")
+    else:
+        channel_id = value
+
     if not channel_id:
+        active_tickets.pop(str(user_id), None)
+        save_active_tickets(active_tickets)
         return
 
     channel = bot.get_channel(int(channel_id))
@@ -140,6 +186,8 @@ def build_ticket_overwrites(
         guild.default_role: discord.PermissionOverwrite(
             view_channel=False
         ),
+
+        # Userul care a creat ticketul poate scrie mereu.
         ticket_owner: discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
@@ -147,20 +195,25 @@ def build_ticket_overwrites(
             attach_files=True,
             embed_links=True
         ),
+
+        # Staff-ul vede ticketul, dar NU poate scrie pana nu apasa Preia Ticket.
         support_role: discord.PermissionOverwrite(
             view_channel=True,
-            send_messages=True,
+            send_messages=False,
             read_message_history=True,
-            attach_files=True,
-            embed_links=True
+            attach_files=False,
+            embed_links=False
         ),
+
+        # Rolul de inchidere vede ticketul si poate apasa butoanele, dar nu scrie pana nu preia.
         close_role: discord.PermissionOverwrite(
             view_channel=True,
-            send_messages=True,
+            send_messages=False,
             read_message_history=True,
-            attach_files=True,
-            embed_links=True
+            attach_files=False,
+            embed_links=False
         ),
+
         guild.me: discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
@@ -209,7 +262,8 @@ class TicketIdModal(discord.ui.Modal, title="Creează Ticket"):
         await cleanup_missing_ticket(interaction.user.id)
 
         if str(interaction.user.id) in active_tickets:
-            channel_id = active_tickets[str(interaction.user.id)]
+            value = active_tickets[str(interaction.user.id)]
+            channel_id = value.get("channel_id") if isinstance(value, dict) else value
             channel = interaction.guild.get_channel(int(channel_id))
             if channel:
                 await interaction.response.send_message(
@@ -253,14 +307,29 @@ class TicketIdModal(discord.ui.Modal, title="Creează Ticket"):
                 reason=f"Ticket creat de {interaction.user}"
             )
 
-            active_tickets[str(interaction.user.id)] = str(ticket_channel.id)
+            active_tickets[str(interaction.user.id)] = {
+                "channel_id": str(ticket_channel.id),
+                "game_id": str(self.game_id.value),
+                "taken_by": None
+            }
             save_active_tickets(active_tickets)
 
             await ticket_channel.send(
                 content=f"{interaction.user.mention} {support_role.mention}",
                 embed=build_ticket_embed(interaction.user, str(self.game_id.value)),
-                view=CloseTicketView()
+                view=TicketControlView()
             )
+
+            log_embed = discord.Embed(
+                title="🎫 Ticket creat",
+                description=(
+                    f"Ticket creat de: {interaction.user.mention}\n"
+                    f"Canal: {ticket_channel.mention}\n"
+                    f"ID jucător: `{self.game_id.value}`"
+                ),
+                color=discord.Color.blue()
+            )
+            await send_log(interaction.guild, log_embed)
 
             await interaction.response.send_message(
                 f"✅ Ticketul tău a fost creat: {ticket_channel.mention}",
@@ -293,9 +362,97 @@ class TicketPanelView(discord.ui.View):
         await interaction.response.send_modal(TicketIdModal())
 
 
-class CloseTicketView(discord.ui.View):
+class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Preia Ticket",
+        style=discord.ButtonStyle.success,
+        emoji="✅",
+        custom_id="bot_ticket:take_ticket"
+    )
+    async def take_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "❌ Această acțiune poate fi folosită doar pe server.",
+                ephemeral=True
+            )
+            return
+
+        if not can_staff_take_ticket(interaction.user):
+            await interaction.response.send_message(
+                "❌ Nu ai permisiunea să preiei acest ticket.",
+                ephemeral=True
+            )
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "❌ Această acțiune poate fi folosită doar într-un canal ticket.",
+                ephemeral=True
+            )
+            return
+
+        owner_id, record = get_ticket_record_by_channel(channel.id)
+        if record is None:
+            await interaction.response.send_message(
+                "❌ Acest canal nu este înregistrat ca ticket activ.",
+                ephemeral=True
+            )
+            return
+
+        if record.get("taken_by"):
+            taken_member = interaction.guild.get_member(int(record["taken_by"]))
+            taken_text = taken_member.mention if taken_member else f"`{record['taken_by']}`"
+            await interaction.response.send_message(
+                f"❌ Acest ticket este deja preluat de {taken_text}.",
+                ephemeral=True
+            )
+            return
+
+        try:
+            # Doar adminul/staff-ul care a preluat primeste acces sa scrie.
+            await channel.set_permissions(
+                interaction.user,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+                reason="Ticket preluat"
+            )
+
+            record["taken_by"] = str(interaction.user.id)
+            active_tickets[str(owner_id)] = record
+            save_active_tickets(active_tickets)
+
+            await interaction.response.send_message(
+                f"✅ Ticket preluat de {interaction.user.mention}."
+            )
+
+            log_embed = discord.Embed(
+                title="✅ Ticket preluat",
+                description=(
+                    f"Ticket preluat de user: {interaction.user.mention}\n"
+                    f"Canal: {channel.mention}\n"
+                    f"Ticket creat de: <@{owner_id}>"
+                ),
+                color=discord.Color.green()
+            )
+            await send_log(interaction.guild, log_embed)
+
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ Botul nu are permisiuni pentru a modifica accesul la canal.",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Eroare la preluarea ticketului: `{e}`",
+                ephemeral=True
+            )
 
     @discord.ui.button(
         label="Ticket terminat",
@@ -326,16 +483,27 @@ class CloseTicketView(discord.ui.View):
             )
             return
 
-        for user_id, channel_id in list(active_tickets.items()):
-            if str(channel.id) == str(channel_id):
-                active_tickets.pop(user_id, None)
-                save_active_tickets(active_tickets)
-                break
+        owner_id, record = get_ticket_record_by_channel(channel.id)
+
+        if owner_id:
+            active_tickets.pop(owner_id, None)
+            save_active_tickets(active_tickets)
 
         await interaction.response.send_message(
             f"🔒 Ticketul a fost închis de {interaction.user.mention}. "
             f"Canalul se va șterge în `{TICKET_DELETE_DELAY}` secunde."
         )
+
+        log_embed = discord.Embed(
+            title="🔒 Ticket închis",
+            description=(
+                f"Ticket închis de user: {interaction.user.mention}\n"
+                f"Canal: `#{channel.name}`\n"
+                f"Ticket creat de: {f'<@{owner_id}>' if owner_id else '`necunoscut`'}"
+            ),
+            color=discord.Color.red()
+        )
+        await send_log(interaction.guild, log_embed)
 
         await asyncio.sleep(TICKET_DELETE_DELAY)
 
@@ -377,7 +545,7 @@ async def on_ready():
     print(f"Bot Ticket online ca {bot.user} | Servere: {len(bot.guilds)}")
 
     bot.add_view(TicketPanelView())
-    bot.add_view(CloseTicketView())
+    bot.add_view(TicketControlView())
 
     try:
         await bot.tree.sync()
@@ -448,7 +616,14 @@ async def ticket_fix_permissions(interaction: discord.Interaction):
 
     fixed = 0
 
-    for user_id, channel_id in list(active_tickets.items()):
+    for user_id, value in list(active_tickets.items()):
+        if isinstance(value, dict):
+            channel_id = value.get("channel_id")
+            taken_by = value.get("taken_by")
+        else:
+            channel_id = value
+            taken_by = None
+
         channel = interaction.guild.get_channel(int(channel_id))
         member = interaction.guild.get_member(int(user_id))
 
@@ -456,13 +631,27 @@ async def ticket_fix_permissions(interaction: discord.Interaction):
             continue
 
         try:
+            overwrites = build_ticket_overwrites(
+                interaction.guild,
+                member,
+                support_role,
+                close_role
+            )
+
+            # Pastreaza accesul de scriere pentru staff-ul care deja a preluat ticketul.
+            if taken_by:
+                taken_member = interaction.guild.get_member(int(taken_by))
+                if taken_member:
+                    overwrites[taken_member] = discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                        attach_files=True,
+                        embed_links=True
+                    )
+
             await channel.edit(
-                overwrites=build_ticket_overwrites(
-                    interaction.guild,
-                    member,
-                    support_role,
-                    close_role
-                ),
+                overwrites=overwrites,
                 reason="Fix permisiuni ticket"
             )
             fixed += 1
